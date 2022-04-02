@@ -448,9 +448,12 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _use_wr
     assert mint_amount >= _min_mint_amount, "Slippage screwed you"
 
     # Take coins from the sender
-    if not _use_wrapped:
-
-        # Take coins from the sender
+    if _use_wrapped:
+        for i in range(N_COINS):
+            amount: uint256 = _amounts[i]
+            if amount != 0:
+                assert ERC20(self.wrapped_coins[i]).transferFrom(msg.sender, self, amount) # dev: failed transfer
+    else:
         for i in range(N_COINS):
             amount: uint256 = _amounts[i]
             if amount != 0:
@@ -469,11 +472,6 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _use_wr
                         EMPTY_BYTES32,
                     )
                 )
-    else:
-        for i in range(N_COINS):
-            amount: uint256 = _amounts[i]
-            if amount != 0:
-                assert ERC20(self.wrapped_coins[i]).transferFrom(msg.sender, self, amount) # dev: failed transfer
 
     # Mint pool tokens
     CurveToken(lp_token).mint(msg.sender, mint_amount)
