@@ -1,4 +1,4 @@
-# @version 0.2.16
+# @version 0.3.1
 """
 @title Curve gPool for use on Fantom
 @author Curve.Fi
@@ -16,8 +16,20 @@ interface CurveToken:
     def mint(_to: address, _value: uint256) -> bool: nonpayable
     def burnFrom(_to: address, _value: uint256) -> bool: nonpayable
 
-interface GeistStaking:
-    def exit(): nonpayable
+interface ValasStaking:
+    def exit(_claim_rewards: bool): nonpayable
+
+interface RewardsToken:
+    def notifyRewardAmount(_reward: address, _amount: uint256): nonpayable
+
+interface AToken:
+    def UNDERLYING_ASSET_ADDRESS() -> address: view
+
+interface Factory:
+    def fee_receiver() -> address: view
+
+interface FeeDistributor:
+    def depositFee(_token: address, _amount: uint256) -> bool: nonpayable
 
 
 # Events
@@ -90,7 +102,7 @@ event StopRampA:
 
 
 N_COINS: constant(int128) = 3
-PRECISION_MUL: constant(uint256[N_COINS]) = [1, 1000000000000, 1000000000000]
+PRECISION_MUL: constant(uint256[N_COINS]) = [1, 1, 1]
 PRECISION: constant(uint256) = 10 ** 18
 
 FEE_DENOMINATOR: constant(uint256) = 10 ** 10
@@ -104,10 +116,10 @@ A_PRECISION: constant(uint256) = 100
 ADMIN_ACTIONS_DELAY: constant(uint256) = 3 * 86400
 MIN_RAMP_TIME: constant(uint256) = 86400
 
-GEIST_REWARDS: constant(address) = 0x297FddC5c33Ef988dd03bd13e162aE084ea1fE57
-GEIST_STAKING: constant(address) = 0x49c93a95dbcc9A6A4D8f77E59c038ce5020e82f8
-GEIST_TOKEN: constant(address) = 0xd8321AA83Fb0a4ECd6348D4577431310A6E0814d
-LENDING_POOL: constant(address) = 0x9FAD24f572045c7869117160A571B2e50b10d068
+VALAS_REWARDS: constant(address) = 0xB7c1d99069a4eb582Fc04E7e1124794000e7ecBF
+VALAS_STAKING: constant(address) = 0x685D3b02b9b0F044A3C01Dbb95408FC2eB15a3b3
+VALAS_TOKEN: constant(address) = 0xB1EbdD56729940089Ecc3aD0BBEEB12b6842ea6F
+LENDING_POOL: constant(address) = 0xE29A55A6AEFf5C8B1beedE5bCF2F0Cb3AF8F91f5
 
 
 coins: public(address[N_COINS])
@@ -118,10 +130,9 @@ fee: public(uint256)  # fee * 1e10
 offpeg_fee_multiplier: public(uint256)  # * 1e10
 admin_fee: public(uint256)  # admin_fee * 1e10
 
+factory: public(address)
 owner: public(address)
 lp_token: public(address)
-
-aave_referral: uint256
 
 initial_A: public(uint256)
 future_A: public(uint256)
@@ -139,14 +150,12 @@ is_killed: bool
 kill_deadline: uint256
 KILL_DEADLINE_DT: constant(uint256) = 2 * 30 * 86400
 
-reward_receiver: public(address)
-admin_fee_receiver: public(address)
 
 @external
 def __init__(
     _coins: address[N_COINS],
-    _underlying_coins: address[N_COINS],
     _pool_token: address,
+    _factory: address,
     _A: uint256,
     _fee: uint256,
     _admin_fee: uint256,
@@ -155,7 +164,6 @@ def __init__(
     """
     @notice Contract constructor
     @param _coins List of wrapped coin addresses
-    @param _underlying_coins List of underlying coin addresses
     @param _pool_token Pool LP token address
     @param _A Amplification coefficient multiplied by n * (n - 1)
     @param _fee Swap fee expressed as an integer with 1e10 precision
@@ -164,34 +172,22 @@ def __init__(
     @param _offpeg_fee_multiplier Offpeg fee multiplier
     """
     for i in range(N_COINS):
-        assert _coins[i] != ZERO_ADDRESS
-        assert _underlying_coins[i] != ZERO_ADDRESS
+        coin: address = _coins[i]
+        underlying_coin: address = AToken(coin).UNDERLYING_ASSET_ADDRESS()
+        self.coins[i] = coin
+        self.underlying_coins[i] = underlying_coin
+        ERC20(underlying_coin).approve(LENDING_POOL, MAX_UINT256)
 
-    self.coins = _coins
-    self.underlying_coins = _underlying_coins
     self.initial_A = _A * A_PRECISION
     self.future_A = _A * A_PRECISION
     self.fee = _fee
     self.admin_fee = _admin_fee
     self.offpeg_fee_multiplier = _offpeg_fee_multiplier
     self.owner = msg.sender
-    self.admin_fee_receiver = msg.sender
     self.kill_deadline = block.timestamp + KILL_DEADLINE_DT
     self.lp_token = _pool_token
 
-    # approve transfer of underlying coin to aave lending pool
-    for coin in _underlying_coins:
-        _response: Bytes[32] = raw_call(
-            coin,
-            concat(
-                method_id("approve(address,uint256)"),
-                convert(LENDING_POOL, bytes32),
-                convert(MAX_UINT256, bytes32)
-            ),
-            max_outsize=32
-        )
-        if len(_response) != 0:
-            assert convert(_response, bool)
+    assert ERC20(VALAS_TOKEN).approve(_pool_token, MAX_UINT256)
 
 
 @view
@@ -371,25 +367,23 @@ def calc_token_amount(_amounts: uint256[N_COINS], is_deposit: bool) -> uint256:
 
 @external
 def claim_rewards():
-    # push wAvax rewards into the reward receiver
-    reward_receiver: address = self.reward_receiver
-    if reward_receiver != ZERO_ADDRESS:
-        raw_call(
-            GEIST_REWARDS,
-            concat(
-                method_id("claim(address,address[])"),
-                convert(self, bytes32),
-                convert(32 * 2, bytes32),
-                convert(3, bytes32),
-                convert(self.coins[0], bytes32),
-                convert(self.coins[1], bytes32),
-                convert(self.coins[2], bytes32),
-            )
+    # push VALAS rewards into the reward receiver
+    raw_call(
+        VALAS_REWARDS,
+        concat(
+            method_id("claim(address,address[])"),
+            convert(self, bytes32),
+            convert(32 * 2, bytes32),
+            convert(3, bytes32),
+            convert(self.coins[0], bytes32),
+            convert(self.coins[1], bytes32),
+            convert(self.coins[2], bytes32),
         )
-        GeistStaking(GEIST_STAKING).exit()
-        amount: uint256 = ERC20(GEIST_TOKEN).balanceOf(self)
-        if amount > 0:
-            assert ERC20(GEIST_TOKEN).transfer(reward_receiver, amount)
+    )
+    ValasStaking(VALAS_STAKING).exit(False)
+    amount: uint256 = ERC20(VALAS_TOKEN).balanceOf(self)
+    if amount > 0:
+        RewardsToken(self.lp_token).notifyRewardAmount(VALAS_TOKEN, amount)
 
 
 @external
@@ -456,7 +450,6 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _use_un
 
     # Take coins from the sender
     if _use_underlying:
-        aave_referral: bytes32 = convert(self.aave_referral, bytes32)
 
         # Take coins from the sender
         for i in range(N_COINS):
@@ -464,18 +457,7 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _use_un
             if amount != 0:
                 coin: address = self.underlying_coins[i]
                 # transfer underlying coin from msg.sender to self
-                _response: Bytes[32] = raw_call(
-                    coin,
-                    concat(
-                        method_id("transferFrom(address,address,uint256)"),
-                        convert(msg.sender, bytes32),
-                        convert(self, bytes32),
-                        convert(amount, bytes32)
-                    ),
-                    max_outsize=32
-                )
-                if len(_response) != 0:
-                    assert convert(_response, bool)
+                assert ERC20(coin).transferFrom(msg.sender, self, amount)
 
                 # deposit to aave lending pool
                 raw_call(
@@ -485,7 +467,7 @@ def add_liquidity(_amounts: uint256[N_COINS], _min_mint_amount: uint256, _use_un
                         convert(coin, bytes32),
                         convert(amount, bytes32),
                         convert(self, bytes32),
-                        aave_referral,
+                        EMPTY_BYTES32,
                     )
                 )
     else:
@@ -653,18 +635,7 @@ def exchange_underlying(i: int128, j: int128, dx: uint256, min_dy: uint256) -> u
     u_coin_i: address = self.underlying_coins[i]
 
     # transfer underlying coin from msg.sender to self
-    _response: Bytes[32] = raw_call(
-        u_coin_i,
-        concat(
-            method_id("transferFrom(address,address,uint256)"),
-            convert(msg.sender, bytes32),
-            convert(self, bytes32),
-            convert(dx, bytes32)
-        ),
-        max_outsize=32
-    )
-    if len(_response) != 0:
-        assert convert(_response, bool)
+    assert ERC20(u_coin_i).transferFrom(msg.sender, self, dx)
 
     # deposit to aave lending pool
     raw_call(
@@ -674,7 +645,7 @@ def exchange_underlying(i: int128, j: int128, dx: uint256, min_dy: uint256) -> u
             convert(u_coin_i, bytes32),
             convert(dx, bytes32),
             convert(self, bytes32),
-            convert(self.aave_referral, bytes32),
+            convert(0, bytes32),
         )
     )
     # withdraw `j` underlying from lending pool and transfer to caller
@@ -1031,13 +1002,16 @@ def revert_transfer_ownership():
 
 @external
 def withdraw_admin_fees():
-    assert msg.sender == self.owner  # dev: only owner
+    receiver: address = Factory(self.factory).fee_receiver()
 
     for i in range(N_COINS):
-        value: uint256 = self.admin_balances[i]
-        if value != 0:
-            assert ERC20(self.coins[i]).transfer(self.admin_fee_receiver, value)
+        amount: uint256 = self.admin_balances[i]
+        if amount != 0:
             self.admin_balances[i] = 0
+            underlying_coin: address = self.underlying_coins[i]
+            LendingPool(LENDING_POOL).withdraw(underlying_coin, amount, self)
+            ERC20(underlying_coin).approve(receiver, amount)
+            FeeDistributor(receiver).depositFee(underlying_coin, amount)
 
 
 @external
@@ -1061,34 +1035,3 @@ def kill_me():
 def unkill_me():
     assert msg.sender == self.owner  # dev: only owner
     self.is_killed = False
-
-
-@external
-def set_aave_referral(referral_code: uint256):
-    assert msg.sender == self.owner  # dev: only owner
-    assert referral_code < 2 ** 16  # dev: uint16 overflow
-    self.aave_referral = referral_code
-
-
-@external
-def set_reward_receiver(_reward_receiver: address):
-    assert msg.sender == self.owner
-    self.reward_receiver = _reward_receiver
-
-
-@external
-def set_admin_fee_receiver(_admin_fee_receiver: address):
-    assert msg.sender == self.owner
-    self.admin_fee_receiver = _admin_fee_receiver
-
-
-@external
-def recover_token(_token: address):
-    """
-    @notice Transfer arbitrary ERC20's out of the pool
-    @dev Allows the admin to rescue gTokens that accrue from staked GEIST
-    """
-    assert msg.sender == self.owner
-    assert _token not in self.coins
-    amount: uint256 = ERC20(_token).balanceOf(self)
-    ERC20(_token).transfer(msg.sender, amount)
