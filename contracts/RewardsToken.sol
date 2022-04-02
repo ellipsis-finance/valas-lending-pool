@@ -11,6 +11,10 @@ interface IFactory {
     function admin() external view returns (address);
 }
 
+interface IStableSwapValas {
+    function claim_rewards() external;
+}
+
 
 // LP Token with rewards capability for http://ellipsis.finance/
 // ERC20 that represents a deposit into an Ellipsis pool and allows 3rd-party incentives for token holders
@@ -105,6 +109,10 @@ contract ValasRewardsToken is ReentrancyGuard {
     }
 
     modifier updateReward(address payable[2] memory accounts) {
+        if (accounts[0] != address(0) && rewardData[VALAS].periodFinish + 3600 < block.timestamp + WEEK) {
+            // claim VALAS from the pool once per hour
+            IStableSwapValas(minter).claim_rewards();
+        }
         rewardData[VALAS].rewardPerTokenStored = rewardPerToken(VALAS);
         rewardData[VALAS].lastUpdateTime = lastTimeRewardApplicable(VALAS);
         for (uint x = 0; x < accounts.length; x++) {
