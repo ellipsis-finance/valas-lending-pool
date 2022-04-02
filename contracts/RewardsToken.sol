@@ -15,10 +15,18 @@ interface IFactory {
 // LP Token with rewards capability for http://ellipsis.finance/
 // ERC20 that represents a deposit into an Ellipsis pool and allows 3rd-party incentives for token holders
 // Based on SNX MultiRewards by iamdefinitelyahuman - https://github.com/iamdefinitelyahuman/multi-rewards
-contract RewardsToken is ReentrancyGuard {
-
+contract ValasRewardsToken is ReentrancyGuard {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
+
+    struct Reward {
+        address rewardsDistributor;
+        uint256 rewardsDuration;
+        uint256 periodFinish;
+        uint256 rewardRate;
+        uint256 lastUpdateTime;
+        uint256 rewardPerTokenStored;
+    }
 
     /* ========== STATE VARIABLES ========== */
 
@@ -31,14 +39,6 @@ contract RewardsToken is ReentrancyGuard {
     address public minter;
     IFactory public factory;
 
-    struct Reward {
-        address rewardsDistributor;
-        uint256 rewardsDuration;
-        uint256 periodFinish;
-        uint256 rewardRate;
-        uint256 lastUpdateTime;
-        uint256 rewardPerTokenStored;
-    }
     mapping(address => Reward) public rewardData;
     address[] public rewardTokens;
 
@@ -54,6 +54,9 @@ contract RewardsToken is ReentrancyGuard {
     // owner -> spender -> amount
     mapping(address => mapping(address => uint256)) public allowance;
 
+    address constant VALAS = 0xB1EbdD56729940089Ecc3aD0BBEEB12b6842ea6F;
+    uint256 constant WEEK = 604800;
+
     /* ========== EVENTS ========== */
 
     event RewardAdded(uint256 reward);
@@ -65,46 +68,29 @@ contract RewardsToken is ReentrancyGuard {
 
     /* ========== CONSTRUCTOR ========== */
 
-    constructor() {
-        // prevent the implementation contract from being used as a token
-        minter = address(31337);
-    }
-
-    function initialize(
+    constructor(
         string memory _name,
         string memory _symbol,
-        address _minter
-    )
-        external
-    {
-        require(minter == address(0));
+        address _minter,
+        address _factory
+    ) {
         name = _name;
         symbol = _symbol;
         minter = _minter;
-        factory = IFactory(msg.sender);
+        factory = IFactory(_factory);
         emit Transfer(address(0), _minter, 0);
+
+        // VALAS is set as the reward token, adding further reward tokens is not possible
+        // the contract is optimized for one reward token to minimize gas costs for metapools
+        // that use this as their base token
+        rewardTokens.push(VALAS);
+        rewardData[VALAS].rewardsDistributor = _minter;
+        rewardData[VALAS].rewardsDuration = WEEK;
+        rewardCount = 1;
+
     }
 
     /* ========== ADMIN FUNCTIONS ========== */
-
-    function addReward(
-        address _rewardsToken,
-        address _rewardsDistributor,
-        uint256 _rewardsDuration
-    )
-        public
-        onlyOwner
-    {
-        require(rewardData[_rewardsToken].rewardsDuration == 0);
-        rewardTokens.push(_rewardsToken);
-        rewardData[_rewardsToken].rewardsDistributor = _rewardsDistributor;
-        rewardData[_rewardsToken].rewardsDuration = _rewardsDuration;
-        rewardCount++;
-    }
-
-    function setRewardsDistributor(address _rewardsToken, address _rewardsDistributor) external onlyOwner {
-        rewardData[_rewardsToken].rewardsDistributor = _rewardsDistributor;
-    }
 
     function setDepositContract(address _account, bool _isDepositContract) external onlyOwner {
         require(balanceOf[_account] == 0, "Address has a balance");
@@ -114,22 +100,19 @@ contract RewardsToken is ReentrancyGuard {
     /* ========== MODIFIERS ========== */
 
     modifier onlyOwner() {
-        require(minter == address(0) || msg.sender == owner());
+        require(msg.sender == owner());
         _;
     }
 
     modifier updateReward(address payable[2] memory accounts) {
-        for (uint i; i < rewardTokens.length; i++) {
-            address token = rewardTokens[i];
-            rewardData[token].rewardPerTokenStored = rewardPerToken(token);
-            rewardData[token].lastUpdateTime = lastTimeRewardApplicable(token);
-            for (uint x = 0; x < accounts.length; x++) {
-                address account = accounts[x];
-                if (account == address(0)) break;
-                if (depositContracts[account]) continue;
-                rewards[account][token] = earned(account, token);
-                userRewardPerTokenPaid[account][token] = rewardData[token].rewardPerTokenStored;
-            }
+        rewardData[VALAS].rewardPerTokenStored = rewardPerToken(VALAS);
+        rewardData[VALAS].lastUpdateTime = lastTimeRewardApplicable(VALAS);
+        for (uint x = 0; x < accounts.length; x++) {
+            address account = accounts[x];
+            if (account == address(0)) break;
+            if (depositContracts[account]) continue;
+            rewards[account][VALAS] = earned(account, VALAS);
+            userRewardPerTokenPaid[account][VALAS] = rewardData[VALAS].rewardPerTokenStored;
         }
         _;
     }
@@ -221,14 +204,12 @@ contract RewardsToken is ReentrancyGuard {
     }
 
     function getReward() public nonReentrant updateReward([msg.sender, address(0)]) {
-        for (uint i; i < rewardTokens.length; i++) {
-            address _rewardsToken = rewardTokens[i];
-            uint256 reward = rewards[msg.sender][_rewardsToken];
-            if (reward > 0) {
-                rewards[msg.sender][_rewardsToken] = 0;
-                IERC20(_rewardsToken).safeTransfer(msg.sender, reward);
-                emit RewardPaid(msg.sender, _rewardsToken, reward);
-            }
+
+        uint256 reward = rewards[msg.sender][VALAS];
+        if (reward > 0) {
+            rewards[msg.sender][VALAS] = 0;
+            IERC20(VALAS).safeTransfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, VALAS, reward);
         }
     }
 
@@ -241,40 +222,23 @@ contract RewardsToken is ReentrancyGuard {
         external
         updateReward([address(0), address(0)])
     {
-        require(rewardData[_rewardsToken].rewardsDistributor == msg.sender);
+        require(_rewardsToken == VALAS);
+        require(rewardData[VALAS].rewardsDistributor == msg.sender);
         // handle the transfer of reward tokens via `transferFrom` to reduce the number
         // of transactions required and ensure correctness of the reward amount
-        IERC20(_rewardsToken).safeTransferFrom(msg.sender, address(this), reward);
+        IERC20(VALAS).safeTransferFrom(msg.sender, address(this), reward);
 
-        if (block.timestamp >= rewardData[_rewardsToken].periodFinish) {
-            rewardData[_rewardsToken].rewardRate = reward.div(rewardData[_rewardsToken].rewardsDuration);
+        if (block.timestamp >= rewardData[VALAS].periodFinish) {
+            rewardData[VALAS].rewardRate = reward.div(rewardData[VALAS].rewardsDuration);
         } else {
-            uint256 remaining = rewardData[_rewardsToken].periodFinish.sub(block.timestamp);
-            uint256 leftover = remaining.mul(rewardData[_rewardsToken].rewardRate);
-            rewardData[_rewardsToken].rewardRate = reward.add(leftover).div(rewardData[_rewardsToken].rewardsDuration);
+            uint256 remaining = rewardData[VALAS].periodFinish.sub(block.timestamp);
+            uint256 leftover = remaining.mul(rewardData[VALAS].rewardRate);
+            rewardData[VALAS].rewardRate = reward.add(leftover).div(rewardData[VALAS].rewardsDuration);
         }
 
-        rewardData[_rewardsToken].lastUpdateTime = block.timestamp;
-        rewardData[_rewardsToken].periodFinish = block.timestamp.add(rewardData[_rewardsToken].rewardsDuration);
+        rewardData[VALAS].lastUpdateTime = block.timestamp;
+        rewardData[VALAS].periodFinish = block.timestamp.add(rewardData[VALAS].rewardsDuration);
         emit RewardAdded(reward);
-    }
-
-    // Added to support recovering LP Rewards from other systems such as BAL to be distributed to holders
-    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyOwner {
-        require(rewardData[tokenAddress].lastUpdateTime == 0, "Cannot withdraw reward token");
-        IERC20(tokenAddress).safeTransfer(msg.sender, tokenAmount);
-        emit Recovered(tokenAddress, tokenAmount);
-    }
-
-    function setRewardsDuration(address _rewardsToken, uint256 _rewardsDuration) external {
-        require(
-            block.timestamp > rewardData[_rewardsToken].periodFinish,
-            "Reward period still active"
-        );
-        require(rewardData[_rewardsToken].rewardsDistributor == msg.sender);
-        require(_rewardsDuration > 0, "Reward duration must be non-zero");
-        rewardData[_rewardsToken].rewardsDuration = _rewardsDuration;
-        emit RewardsDurationUpdated(_rewardsToken, rewardData[_rewardsToken].rewardsDuration);
     }
 
     function mint(
