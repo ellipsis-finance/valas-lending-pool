@@ -9,10 +9,16 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IFactory {
     function admin() external view returns (address);
+    function get_base_pool(address pool) external view returns (address);
+    function get_lp_token(address pool) external view returns (address);
 }
 
 interface IStableSwapValas {
     function claim_rewards() external;
+}
+
+interface IRewardsToken {
+    function notifyRewardAmount(address reward, uint256 amount) external;
 }
 
 
@@ -30,6 +36,10 @@ contract ValasRewardsToken is ReentrancyGuard {
         uint256 rewardRate;
         uint256 lastUpdateTime;
         uint256 rewardPerTokenStored;
+    }
+    struct MetaPoolData {
+        uint256 lastClaim;
+        address lpToken;
     }
 
     /* ========== STATE VARIABLES ========== */
@@ -57,6 +67,8 @@ contract ValasRewardsToken is ReentrancyGuard {
 
     // owner -> spender -> amount
     mapping(address => mapping(address => uint256)) public allowance;
+
+    mapping(address => MetaPoolData) metapoolClaims;
 
     address constant VALAS = 0xB1EbdD56729940089Ecc3aD0BBEEB12b6842ea6F;
     uint256 constant WEEK = 604800;
@@ -101,6 +113,17 @@ contract ValasRewardsToken is ReentrancyGuard {
         depositContracts[_account] = _isDepositContract;
     }
 
+    // force an update to metapoolClaims (in case someone sent tokens
+    // to a metapool LP token address before the token was deployed)
+    function refreshMetapoolClaims(address account) external {
+        if (factory.get_base_pool(account) == minter) {
+            metapoolClaims[account].lpToken = factory.get_lp_token(account);
+            metapoolClaims[account].lastClaim = 0;
+        } else {
+            metapoolClaims[account].lastClaim = uint(-1);
+        }
+    }
+
     /* ========== MODIFIERS ========== */
 
     modifier onlyOwner() {
@@ -113,14 +136,36 @@ contract ValasRewardsToken is ReentrancyGuard {
             // claim VALAS from the pool once per hour
             IStableSwapValas(minter).claim_rewards();
         }
+
         rewardData[VALAS].rewardPerTokenStored = rewardPerToken(VALAS);
         rewardData[VALAS].lastUpdateTime = lastTimeRewardApplicable(VALAS);
         for (uint x = 0; x < accounts.length; x++) {
             address account = accounts[x];
             if (account == address(0)) break;
             if (depositContracts[account]) continue;
-            rewards[account][VALAS] = earned(account, VALAS);
+
+            // check if `account` is a metapool that uses this LP token as a base pool
+            uint256 lastClaim = metapoolClaims[account].lastClaim;
+            if (lastClaim == 0) {
+                if (factory.get_base_pool(account) == minter) {
+                    metapoolClaims[account].lpToken = factory.get_lp_token(account);
+                } else {
+                    lastClaim = uint(-1);
+                    metapoolClaims[account].lastClaim = lastClaim;
+                }
+            }
+
+            uint256 reward = earned(account, VALAS);
             userRewardPerTokenPaid[account][VALAS] = rewardData[VALAS].rewardPerTokenStored;
+            if (lastClaim < block.timestamp - 3600 && reward > 0) {
+                // if account is a metapool and the last claim was > 1 hour ago, push the rewards
+                rewards[account][VALAS] = 0;
+                metapoolClaims[account].lastClaim = block.timestamp;
+                IERC20(VALAS).approve(metapoolClaims[account].lpToken, reward);
+                IRewardsToken(metapoolClaims[account].lpToken).notifyRewardAmount(VALAS, reward);
+            } else {
+                rewards[account][VALAS] = reward;
+            }
         }
         _;
     }
