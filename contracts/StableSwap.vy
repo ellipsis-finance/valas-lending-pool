@@ -186,6 +186,7 @@ def __init__(
     self.owner = msg.sender
     self.kill_deadline = block.timestamp + KILL_DEADLINE_DT
     self.lp_token = _pool_token
+    self.factory = _factory
 
     assert ERC20(VALAS_TOKEN).approve(_pool_token, MAX_UINT256)
 
