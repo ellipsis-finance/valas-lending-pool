@@ -7,7 +7,7 @@
 """
 
 interface ERC20:
-    def approve(_spender: address, _amount: uint256): nonpayable
+    def approve(_spender: address, _amount: uint256) -> bool: nonpayable
     def balanceOf(_owner: address) -> uint256: view
     def transfer(_to: address, _amount: uint256) -> bool: nonpayable
     def transferFrom(_from: address, _to: address, _amount: uint256) -> bool: nonpayable
@@ -143,6 +143,9 @@ future_A_time: public(uint256)
 
 rate_multiplier: uint256
 
+is_killed: bool
+kill_deadline: uint256
+KILL_DEADLINE_DT: constant(uint256) = 2 * 30 * 86400
 
 @external
 def __init__(
@@ -169,7 +172,9 @@ def __init__(
     self.fee = _fee
     self.factory = _factory
     self.lp_token = _lp_token
+    self.kill_deadline = block.timestamp + KILL_DEADLINE_DT
 
+    assert ERC20(VALAS_TOKEN).approve(_lp_token, MAX_UINT256)
     for coin in BASE_COINS:
         ERC20(coin).approve(BASE_POOL, MAX_UINT256)
 
@@ -179,7 +184,7 @@ def __init__(
 def _balances() -> uint256[N_COINS]:
     result: uint256[N_COINS] = empty(uint256[N_COINS])
     for i in range(N_COINS):
-        result[i] = ERC20(self.coins[i]).balanceOf(self) - self.admin_balances[i]
+        result[i] = ERC20(self.wrapped_coins[i]).balanceOf(self) - self.admin_balances[i]
     return result
 
 
@@ -370,15 +375,17 @@ def claim_rewards():
 def add_liquidity(
     _amounts: uint256[N_COINS],
     _min_mint_amount: uint256,
-    _receiver: address = msg.sender
+    _use_wrapped: bool = False
 ) -> uint256:
     """
     @notice Deposit coins into the pool
     @param _amounts List of amounts of coins to deposit
     @param _min_mint_amount Minimum amount of LP tokens to mint from the deposit
-    @param _receiver Address that owns the minted LP tokens
+    @param _use_wrapped if True, add liquidity using `wrapped_coins`
     @return Amount of LP tokens received by depositing
     """
+    assert not self.is_killed  # dev: is killed
+
     amp: uint256 = self._A()
     old_balances: uint256[N_COINS] = self._balances()
     rates: uint256[N_COINS] = [self.rate_multiplier, Curve(BASE_POOL).get_virtual_price()]
@@ -395,7 +402,9 @@ def add_liquidity(
         if amount == 0:
             assert total_supply > 0
         else:
-            if i == 0:
+            if _use_wrapped or i == 1:
+                assert ERC20(self.wrapped_coins[i]).transferFrom(msg.sender, self, amount)
+            else:
                 coin: address = self.coins[0]
                 # transfer underlying coin from msg.sender to self
                 assert ERC20(coin).transferFrom(msg.sender, self, amount)
@@ -410,9 +419,6 @@ def add_liquidity(
                         EMPTY_BYTES32,
                     )
                 )
-            else:
-                coin: address = self.wrapped_coins[i]
-                assert ERC20(coin).transferFrom(msg.sender, self, amount)
             new_balances[i] += amount
 
     # Invariant after change
@@ -445,7 +451,7 @@ def add_liquidity(
     assert mint_amount >= _min_mint_amount
 
     # Mint pool tokens
-    CurveToken(self.lp_token).mint(_receiver, mint_amount)
+    CurveToken(self.lp_token).mint(msg.sender, mint_amount)
 
     log AddLiquidity(msg.sender, _amounts, fees, D1, total_supply + mint_amount)
 
@@ -589,7 +595,7 @@ def exchange(
     j: int128,
     _dx: uint256,
     _min_dy: uint256,
-    _receiver: address = msg.sender,
+    _use_wrapped: bool = False,
 ) -> uint256:
     """
     @notice Perform an exchange between two coins
@@ -598,17 +604,22 @@ def exchange(
     @param j Index valie of the coin to recieve
     @param _dx Amount of `i` being exchanged
     @param _min_dy Minimum amount of `j` to receive
-    @param _receiver Address that receives `j`
+    @param _use_wrapped if True, swap between `wrapped_coins`
     @return Actual amount of `j` received
     """
+    assert not self.is_killed  # dev: is killed
+
     old_balances: uint256[N_COINS] = self._balances()
     rates: uint256[N_COINS] = [self.rate_multiplier, Curve(BASE_POOL).get_virtual_price()]
 
     xp: uint256[N_COINS] = self._xp_mem(rates, old_balances)
 
-    coin: address = self.coins[i]
-    assert ERC20(coin).transferFrom(msg.sender, self, _dx)
-    if i == 0:
+
+    if _use_wrapped or i == 1:
+        assert ERC20(self.wrapped_coins[i]).transferFrom(msg.sender, self, _dx)
+    else:
+        coin: address = self.coins[0]
+        assert ERC20(coin).transferFrom(msg.sender, self, _dx)
         raw_call(
             LENDING_POOL,
             concat(
@@ -630,10 +641,10 @@ def exchange(
 
     self.admin_balances[j] += (dy_fee * ADMIN_FEE / FEE_DENOMINATOR) * PRECISION / rates[j]
 
-    if j == 0:
-        LendingPool(LENDING_POOL).withdraw(self.coins[0], dy, _receiver)
+    if _use_wrapped or j == 1:
+        assert ERC20(self.wrapped_coins[j]).transfer(msg.sender, dy)
     else:
-        assert ERC20(self.coins[1]).transfer(_receiver, dy)
+        LendingPool(LENDING_POOL).withdraw(self.coins[0], dy, msg.sender)
 
     log TokenExchange(msg.sender, i, _dx, j, dy)
 
@@ -646,18 +657,19 @@ def exchange_underlying(
     i: int128,
     j: int128,
     _dx: uint256,
-    _min_dy: uint256,
-    _receiver: address = msg.sender,
+    _min_dy: uint256
 ) -> uint256:
     """
     @notice Perform an exchange between two underlying coins
+    @dev Underlying refers to the base pool coins, not the wrapped/underlying within this contract
     @param i Index value for the underlying coin to send
     @param j Index valie of the underlying coin to receive
     @param _dx Amount of `i` being exchanged
     @param _min_dy Minimum amount of `j` to receive
-    @param _receiver Address that receives `j`
     @return Actual amount of `j` received
     """
+    assert not self.is_killed  # dev: is killed
+
     old_balances: uint256[N_COINS] = self._balances()
     rates: uint256[N_COINS] = [self.rate_multiplier, Curve(BASE_POOL).get_virtual_price()]
     xp: uint256[N_COINS] = self._xp_mem(rates, old_balances)
@@ -749,9 +761,9 @@ def exchange_underlying(
         dy = ERC20(output_coin).balanceOf(self) - dy
 
     if j == 0:
-        LendingPool(LENDING_POOL).withdraw(self.coins[0], dy, _receiver)
+        LendingPool(LENDING_POOL).withdraw(output_coin, dy, msg.sender)
     else:
-        assert ERC20(self.coins[1]).transfer(_receiver, dy)
+        assert ERC20(output_coin).transfer(msg.sender, dy)
 
     log TokenExchangeUnderlying(msg.sender, i, dx, j, dy)
 
@@ -763,14 +775,14 @@ def exchange_underlying(
 def remove_liquidity(
     _burn_amount: uint256,
     _min_amounts: uint256[N_COINS],
-    _receiver: address = msg.sender
+    _use_wrapped: bool = False
 ) -> uint256[N_COINS]:
     """
     @notice Withdraw coins from the pool
     @dev Withdrawal amounts are based on current deposit ratios
     @param _burn_amount Quantity of LP tokens to burn in the withdrawal
     @param _min_amounts Minimum amounts of underlying coins to receive
-    @param _receiver Address that receives the withdrawn coins
+    @param _use_wrapped if True, remove liquidity in `wrapped_coins`
     @return List of amounts of coins that were withdrawn
     """
     total_supply: uint256 = CurveToken(self.lp_token).totalSupply()
@@ -781,10 +793,10 @@ def remove_liquidity(
         value: uint256 = balances[i] * _burn_amount / total_supply
         assert value >= _min_amounts[i]
         amounts[i] = value
-        if i == 0:
-            LendingPool(LENDING_POOL).withdraw(self.coins[0], value, _receiver)
+        if _use_wrapped or i == 1:
+            assert ERC20(self.wrapped_coins[i]).transfer(msg.sender, value)
         else:
-            assert ERC20(self.wrapped_coins[1]).transfer(_receiver, value)
+            LendingPool(LENDING_POOL).withdraw(self.coins[0], value, msg.sender)
 
     CurveToken(self.lp_token).burnFrom(msg.sender, _burn_amount)
 
@@ -798,15 +810,17 @@ def remove_liquidity(
 def remove_liquidity_imbalance(
     _amounts: uint256[N_COINS],
     _max_burn_amount: uint256,
-    _receiver: address = msg.sender
+    _use_wrapped: bool = False
 ) -> uint256:
     """
     @notice Withdraw coins from the pool in an imbalanced amount
     @param _amounts List of amounts of underlying coins to withdraw
     @param _max_burn_amount Maximum amount of LP token to burn in the withdrawal
-    @param _receiver Address that receives the withdrawn coins
+    @param _use_wrapped if True, remove liquidity in `wrapped_coins`
     @return Actual amount of the LP token burned in the withdrawal
     """
+    assert not self.is_killed  # dev: is killed
+
     amp: uint256 = self._A()
     old_balances: uint256[N_COINS] = self._balances()
     rates: uint256[N_COINS] = [self.rate_multiplier, Curve(BASE_POOL).get_virtual_price()]
@@ -817,10 +831,10 @@ def remove_liquidity_imbalance(
         amount: uint256 = _amounts[i]
         if amount != 0:
             new_balances[i] -= amount
-            if i == 0:
-                LendingPool(LENDING_POOL).withdraw(self.coins[0], amount, _receiver)
+            if _use_wrapped or i == 1:
+                assert ERC20(self.wrapped_coins[i]).transfer(msg.sender, amount)
             else:
-                assert ERC20(self.wrapped_coins[1]).transfer(_receiver, amount)
+                LendingPool(LENDING_POOL).withdraw(self.coins[0], amount, msg.sender)
 
     D1: uint256 = self.get_D_mem(rates, new_balances, amp)
 
@@ -950,16 +964,18 @@ def remove_liquidity_one_coin(
     _burn_amount: uint256,
     i: int128,
     _min_received: uint256,
-    _receiver: address = msg.sender,
+    _use_wrapped: bool = False
 ) -> uint256:
     """
     @notice Withdraw a single coin from the pool
     @param _burn_amount Amount of LP tokens to burn in the withdrawal
     @param i Index value of the coin to withdraw
     @param _min_received Minimum amount of coin to receive
-    @param _receiver Address that receives the withdrawn coins
+    @param _use_wrapped if True, remove liquidity in `wrapped_coins`
     @return Amount of coin received
     """
+    assert not self.is_killed  # dev: is killed
+
     dy: uint256[2] = self._calc_withdraw_one_coin(_burn_amount, i)
     assert dy[0] >= _min_received
 
@@ -967,10 +983,10 @@ def remove_liquidity_one_coin(
     CurveToken(self.lp_token).burnFrom(msg.sender, _burn_amount)
     total_supply: uint256 = CurveToken(self.lp_token).totalSupply()
 
-    if i == 0:
-        LendingPool(LENDING_POOL).withdraw(self.coins[0], dy[0], _receiver)
+    if _use_wrapped or i == 1:
+        assert ERC20(self.wrapped_coins[i]).transfer(msg.sender, dy[0])
     else:
-        assert ERC20(self.wrapped_coins[1]).transfer(_receiver, dy[0])
+        LendingPool(LENDING_POOL).withdraw(self.coins[0], dy[0], msg.sender)
 
     log RemoveLiquidityOne(msg.sender, _burn_amount, dy[0], total_supply)
 
@@ -1027,3 +1043,16 @@ def withdraw_admin_fees():
                 LendingPool(LENDING_POOL).withdraw(underlying_coin, amount, self)
             ERC20(underlying_coin).approve(receiver, amount)
             FeeDistributor(receiver).depositFee(underlying_coin, amount)
+
+
+@external
+def kill_me():
+    assert msg.sender == Factory(self.factory).admin()  # dev: only owner
+    assert self.kill_deadline > block.timestamp  # dev: deadline has passed
+    self.is_killed = True
+
+
+@external
+def unkill_me():
+    assert msg.sender == Factory(self.factory).admin()  # dev: only owner
+    self.is_killed = False
