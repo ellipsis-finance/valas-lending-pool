@@ -11,14 +11,14 @@ interface IFactory {
     function admin() external view returns (address);
 }
 
-interface IStableSwapValas {
+interface IStableSwap {
     function claim_rewards() external;
 }
 
 // LP Token with rewards capability for http://ellipsis.finance/
 // ERC20 that represents a deposit into an Ellipsis pool and allows 3rd-party incentives for token holders
 // Based on SNX MultiRewards by iamdefinitelyahuman - https://github.com/iamdefinitelyahuman/multi-rewards
-contract ValasMetapoolRewardsToken is ReentrancyGuard {
+contract MetapoolFixedRewardsToken is ReentrancyGuard {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
@@ -57,7 +57,7 @@ contract ValasMetapoolRewardsToken is ReentrancyGuard {
     // owner -> spender -> amount
     mapping(address => mapping(address => uint256)) public allowance;
 
-    address constant VALAS = 0xB1EbdD56729940089Ecc3aD0BBEEB12b6842ea6F;
+    address immutable public FIXED_REWARD;
     uint256 constant WEEK = 604800;
 
     /* ========== EVENTS ========== */
@@ -75,20 +75,22 @@ contract ValasMetapoolRewardsToken is ReentrancyGuard {
         string memory _name,
         string memory _symbol,
         address _minter,
-        address _factory
+        address _factory,
+        address _reward
     ) {
         name = _name;
         symbol = _symbol;
         minter = _minter;
         factory = IFactory(_factory);
+        FIXED_REWARD = _reward;
         emit Transfer(address(0), _minter, 0);
 
-        // VALAS is set as the reward token, adding further reward tokens is not possible
+        // FIXED_REWARD is set as the reward token, adding further reward tokens is not possible
         // the contract is optimized for one reward token to minimize gas costs for metapools
         // that use this as their base token
-        rewardTokens.push(VALAS);
-        rewardData[VALAS].rewardsDistributor = _minter;
-        rewardData[VALAS].rewardsDuration = WEEK;
+        rewardTokens.push(_reward);
+        rewardData[_reward].rewardsDistributor = _minter;
+        rewardData[_reward].rewardsDuration = WEEK;
         rewardCount = 1;
 
     }
@@ -108,21 +110,21 @@ contract ValasMetapoolRewardsToken is ReentrancyGuard {
     }
 
     modifier updateReward(address payable[2] memory accounts) {
-        if (accounts[0] != address(0) && rewardData[VALAS].periodFinish + 3600 < block.timestamp + WEEK) {
-            // claim VALAS from the pool once per hour
-            IStableSwapValas(minter).claim_rewards();
+        if (accounts[0] != address(0) && rewardData[FIXED_REWARD].periodFinish + 3600 < block.timestamp + WEEK) {
+            // claim FIXED_REWARD from the pool once per hour
+            IStableSwap(minter).claim_rewards();
         }
 
-        rewardData[VALAS].rewardPerTokenStored = rewardPerToken(VALAS);
-        rewardData[VALAS].lastUpdateTime = lastTimeRewardApplicable(VALAS);
+        rewardData[FIXED_REWARD].rewardPerTokenStored = rewardPerToken(FIXED_REWARD);
+        rewardData[FIXED_REWARD].lastUpdateTime = lastTimeRewardApplicable(FIXED_REWARD);
         for (uint x = 0; x < accounts.length; x++) {
             address account = accounts[x];
             if (account == address(0)) break;
             if (depositContracts[account]) continue;
 
-            uint256 reward = earned(account, VALAS);
-            userRewardPerTokenPaid[account][VALAS] = rewardData[VALAS].rewardPerTokenStored;
-            rewards[account][VALAS] = reward;
+            uint256 reward = earned(account, FIXED_REWARD);
+            userRewardPerTokenPaid[account][FIXED_REWARD] = rewardData[FIXED_REWARD].rewardPerTokenStored;
+            rewards[account][FIXED_REWARD] = reward;
         }
         _;
     }
@@ -215,11 +217,11 @@ contract ValasMetapoolRewardsToken is ReentrancyGuard {
 
     function getReward() public nonReentrant updateReward([msg.sender, address(0)]) {
 
-        uint256 reward = rewards[msg.sender][VALAS];
+        uint256 reward = rewards[msg.sender][FIXED_REWARD];
         if (reward > 0) {
-            rewards[msg.sender][VALAS] = 0;
-            IERC20(VALAS).safeTransfer(msg.sender, reward);
-            emit RewardPaid(msg.sender, VALAS, reward);
+            rewards[msg.sender][FIXED_REWARD] = 0;
+            IERC20(FIXED_REWARD).safeTransfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, FIXED_REWARD, reward);
         }
     }
 
@@ -232,22 +234,22 @@ contract ValasMetapoolRewardsToken is ReentrancyGuard {
         external
         updateReward([address(0), address(0)])
     {
-        require(_rewardsToken == VALAS);
-        require(rewardData[VALAS].rewardsDistributor == msg.sender);
+        require(_rewardsToken == FIXED_REWARD);
+        require(rewardData[FIXED_REWARD].rewardsDistributor == msg.sender);
         // handle the transfer of reward tokens via `transferFrom` to reduce the number
         // of transactions required and ensure correctness of the reward amount
-        IERC20(VALAS).safeTransferFrom(msg.sender, address(this), reward);
+        IERC20(FIXED_REWARD).safeTransferFrom(msg.sender, address(this), reward);
 
-        if (block.timestamp >= rewardData[VALAS].periodFinish) {
-            rewardData[VALAS].rewardRate = reward.div(rewardData[VALAS].rewardsDuration);
+        if (block.timestamp >= rewardData[FIXED_REWARD].periodFinish) {
+            rewardData[FIXED_REWARD].rewardRate = reward.div(rewardData[FIXED_REWARD].rewardsDuration);
         } else {
-            uint256 remaining = rewardData[VALAS].periodFinish.sub(block.timestamp);
-            uint256 leftover = remaining.mul(rewardData[VALAS].rewardRate);
-            rewardData[VALAS].rewardRate = reward.add(leftover).div(rewardData[VALAS].rewardsDuration);
+            uint256 remaining = rewardData[FIXED_REWARD].periodFinish.sub(block.timestamp);
+            uint256 leftover = remaining.mul(rewardData[FIXED_REWARD].rewardRate);
+            rewardData[FIXED_REWARD].rewardRate = reward.add(leftover).div(rewardData[FIXED_REWARD].rewardsDuration);
         }
 
-        rewardData[VALAS].lastUpdateTime = block.timestamp;
-        rewardData[VALAS].periodFinish = block.timestamp.add(rewardData[VALAS].rewardsDuration);
+        rewardData[FIXED_REWARD].lastUpdateTime = block.timestamp;
+        rewardData[FIXED_REWARD].periodFinish = block.timestamp.add(rewardData[FIXED_REWARD].rewardsDuration);
         emit RewardAdded(reward);
     }
 
