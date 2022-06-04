@@ -106,6 +106,9 @@ contract FixedRewardsToken is ReentrancyGuard {
         rewardData[_reward].rewardsDuration = WEEK;
         rewardCount = 1;
 
+        // hardcode the EPSv2 staking contract as a deposit contract
+        depositContracts[0x5B74C99AA2356B4eAa7B85dC486843eDff8Dfdbe] = true;
+
     }
 
     /* ========== ADMIN FUNCTIONS ========== */
